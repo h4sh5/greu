@@ -1,0 +1,12 @@
+OS=$(uname)
+if [ "$OS" == "Linux" ]
+then
+	echo using Makefile.linux as Makefile
+	cp Makefile.linux Makefile
+elif [[ $OS == *BSD ]]
+then
+	echo using Makefile.bsd as Makefile
+	cp Makefile.bsd Makefile
+fi
+
+
