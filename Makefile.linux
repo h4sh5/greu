@@ -8,7 +8,7 @@ MAN=
 LDADD=-levent
 
 greu: greu.c gre.h gre.c Makefile.linux
-	gcc $(CFLAGS) $(LDADD) -o $(PROG) $(SRCS)
+	gcc $(CFLAGS) -o $(PROG) $(SRCS) $(LDADD)
 
 clean:
 	rm greu
