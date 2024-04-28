@@ -22,14 +22,13 @@
 
 #include <err.h>
 #include <errno.h>
-
 #include <event.h>
 
-
-
-
-
 #include "gre.h"
+#include "rc4.h"
+
+u_char *encryption_key; // should be 16 bytes
+#define KEYLEN 16
 
 #define IP_MAX 40 /* IPv6 has 39 max characters + NULL */
 #define MTU 1500
@@ -107,7 +106,7 @@ void
 usage(void) 
 {
 	char *usage_msg = "usage: greu [-46d] [-l address] [-p port]\n\
-\t    [-e /dev/tapX[@key]] [-i /dev/tunX[@key]]\n\
+\t    [-e /dev/tapX[@key]] [-i /dev/tunX[@key]] [-K ENCRYPTION_KEY]\n\
 \t    server [port]\n";
 	fprintf(stderr, "%s", usage_msg);
 	exit(INVALID_ARGS);
@@ -118,13 +117,17 @@ static void
 udp_recv(int fd, short revents, void *addr)
 {
 	fprintf(stderr, "======== udp_recv called! ==========\n");
-	char buf[MTU] = {0};
+	u_char encrypted_buf[MTU] = {0};
+	u_char buf[MTU] = {0};
 	// ssize_t rlen = read(fd, buf, MTU);
 
 	struct sockaddr from;
 	socklen_t fromLen = sizeof(struct sockaddr);
 
-	ssize_t rlen = recvfrom(fd, buf, MTU, 0, &from, &fromLen);
+	ssize_t rlen = recvfrom(fd, encrypted_buf, MTU, 0, &from, &fromLen);
+	// decrypt packet
+	RC4_drop(encryption_key, encrypted_buf, buf, KEYLEN, rlen);
+
 	msginfo((struct sockaddr_storage *) &from, fromLen, rlen);
 	hexdump(buf, rlen);
 
@@ -217,8 +220,13 @@ tunnel_recv(int fd, short revents, void *tunnel_arg)
 	fprintf(stderr, "GRE packet:\n");
 	hexdump(grePkt, plen);
 
+	// encrypt packet before sending over network
+	u_char encrypted_pkt[rlen + GRE_MAXLEN];
+	RC4_drop(encryption_key, grePkt, encrypted_pkt, KEYLEN, plen);
+
+
 	/* send this to the udp socket */
-	if (sendto(udpSock, grePkt, plen, 0, &svr_sockaddr, 
+	if (sendto(udpSock, encrypted_pkt, plen, 0, &svr_sockaddr, 
 		sizeof(struct sockaddr)) < 0) {
 		errx(1, "[tunnel_recv] sending udp packet failed");
 	}
@@ -275,6 +283,9 @@ udp_connect(char *host)
 			sizeof(struct sockaddr_in)) < 0)
 		errx(1, "binding host/source port failed");
 
+	if (setsockopt(udpSock, SOL_SOCKET, SO_REUSEADDR, &(int){1}, sizeof(int)) < 0)
+	    errx(1, "binding host/source port failed");
+
 	struct event *ev = malloc(sizeof(struct event));
 	event_set(ev, udpSock, EV_READ|EV_PERSIST, udp_recv, 
 		&res->ai_addr);
@@ -318,6 +329,7 @@ bind_dev(struct tunnel_list *tunnels, const char *path, enum tunnelType type)
 	char *path_without_key = strtok(pathCpy, "@");
 	fprintf(stderr, "[bind dev] %s\n", pathCpy);
 	#ifdef BSD
+	fprintf(stderr, "BSD detected\n");
 	int fd = open(path_without_key, O_RDWR | O_NONBLOCK);
 	#else
 	#include <linux/if.h>
@@ -386,14 +398,15 @@ main (int argc, char *argv[])
 	int ch;
 	// ip4Flag, ip4Flag, daemonizeFlag, listenFlag = false;
 	// int port;
-	daemonizeFlag = true; /* daemonize by default */
+	daemonizeFlag = false;
 	listenFlag = false;
+	encryption_key = NULL;
 	
 	/* by default source port is dest port (4754), and bind on any */
 	// strncpy(src_port, port, sizeof(src_port));
 	// strncpy(bindHost, "0.0.0.0", sizeof(bindHost));
 
-	while ((ch = getopt(argc, argv, "46dl:p:e:i:")) != -1) {
+	while ((ch = getopt(argc, argv, "46dl:p:e:i:K:")) != -1) {
 		switch (ch) {      
 		case '4':       
 			af = AF_INET;
@@ -403,7 +416,7 @@ main (int argc, char *argv[])
 			break;
 
 		case 'd':
-			daemonizeFlag = false;
+			daemonizeFlag = true;
 			break;
 
 		case 'l':
@@ -422,6 +435,11 @@ main (int argc, char *argv[])
 			printf("internet tunnel: %s\n", optarg);
 			bind_dev(&tunnels, optarg, TYPE_IP);
 			break;
+		case 'K':
+			encryption_key = (u_char*) malloc(KEYLEN);
+			memcpy(encryption_key, optarg, KEYLEN);
+			break;
+
 		default:
 			usage();
 		}
@@ -430,8 +448,20 @@ main (int argc, char *argv[])
 	argc -= optind;
 	argv += optind;
 
+	if (encryption_key == NULL) {
+		// gen random key
+		encryption_key = malloc(KEYLEN);
+		for (int i = 0; i < KEYLEN; i++) {
+			encryption_key[i] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0987654321"[random () % 36];
+		}
+		fprintf(stderr, "generated random key for -K on client side: %s\n", encryption_key);
+
+	}
+
 	
 	if (daemonizeFlag) {
+		fprintf(stderr, "daemonizing..\n");
+		fflush(NULL);
 	    daemon(1, 1); //no chdir, no close fds
 	}
 
@@ -474,14 +504,31 @@ main (int argc, char *argv[])
 
 	struct tunnel *tunnel_entry;
 	TAILQ_FOREACH(tunnel_entry, &tunnels, entry) {
+		fprintf(stderr, "adding event for tunnel fd: %d\n", tunnel_entry->fd);
 		// event_set(&e->ev, EVENT_FD(&e->ev), EV_READ|EV_PERSIST, tunnel_recv, NULL);
 		event_set(&tunnel_entry->ev, tunnel_entry->fd, EV_READ|EV_PERSIST, tunnel_recv, tunnel_entry);
-		event_add(&tunnel_entry->ev, NULL);
+		int retcode = event_add(&tunnel_entry->ev, NULL);
+		if (retcode) {
+			fprintf(stderr, "event_add ret code: (%i)\n", retcode);
+			errx(1, "event_add errno: (%i) %s", errno, strerror(errno));
+		}
 		// event_add(&e->ev, NULL);
+	}	
+
+
+	if (TAILQ_EMPTY(&tunnels)) {
+	    errx(1, "TAILQ empty");
 	}
+	int retcode = event_dispatch();
 
-	event_dispatch();
+	// The callback returns 1 when no events are registered any more
+	if (retcode != 0) {
+		fprintf(stderr, "event_dispatch retval: (%i)\n", retcode);
 
+		// errx(1, "errno: (%i) %s", errno, strerror(errno));
+		
+	}
+	fprintf(stderr, "Exiting..\n");
 	return 0;
 }
 

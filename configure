@@ -1,8 +1,7 @@
 OS=$(uname)
 if [ "$OS" == "Linux" ]
 then
-	echo using Makefile.linux as Makefile
-	cp Makefile.linux Makefile
+	echo using default linux Makefilee
 elif [[ $OS == *BSD ]]
 then
 	echo using Makefile.bsd as Makefile
